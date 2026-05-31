@@ -20,33 +20,43 @@ off until someone actually needs it.** That single constraint explains every mov
 
 ```mermaid
 flowchart TD
-    visitor([Visitor browser])
+    visitor([User])
 
-    subgraph free["Free · always on"]
-        wakeup["wakeup_page.R<br/>on shinyapps.io"]
+    subgraph free["Frontend · free, always on"]
+        wakeup["Shiny App<br/>wakeup_page.R + app.R<br/>(shinyapps.io)"]
     end
 
-    subgraph serverless["AWS · serverless"]
-        apigw["API Gateway"]
-        lambda["Lambda<br/>ec2:StartInstances"]
-        cw["CloudWatch alarm<br/>auto-stops idle box"]
+    subgraph control["AWS Control Plane · serverless"]
+        apigw["API Gateway<br/>(HTTP API)"]
+        startL["Lambda<br/>(start-ec2)"]
+        ec2start["EC2<br/>(Start)"]
+        ssm["Systems Manager<br/>(SSM Run Command)"]
     end
 
-    subgraph ec2["EC2 instance · paid, on-demand, auto-stops"]
-        shiny["shiny-server → app.R"]
-        fastapi["FastAPI · main.py<br/>/run-analysis → Rscript"]
+    subgraph compute["AWS Compute Plane · EC2, on-demand"]
+        fastapi["FastAPI (Uvicorn)<br/>systemd auto-start<br/>/status · /run-analysis"]
         analysis["analysis.R<br/>Seurat + AUCell"]
+        localrds[("Local FS<br/>seurat_object.rds<br/>(copy, deleted on stop)")]
     end
 
-    s3[("S3 bucket<br/>Seurat .rds")]
+    subgraph shutdown["Shutdown triggers"]
+        cw["CloudWatch alarm<br/>idle 15 min"]
+        eventbridge["EventBridge rule<br/>every 3 hours"]
+        stopL["Lambda (stop-ec2)<br/>1· delete local .rds via SSM<br/>2· stop instance"]
+    end
 
-    visitor -->|"1 · open page"| wakeup
-    wakeup -->|"2 · POST /start-ec2"| apigw --> lambda --> ec2
+    s3[("Amazon S3<br/>private bucket<br/>seurat_object.rds")]
+
+    visitor -->|"1 · open app"| wakeup
+    wakeup -->|"2 · POST /start-ec2"| apigw --> startL -->|"StartInstances()"| ec2start --> ssm
+    ssm -->|"download .rds to local disk"| s3
     wakeup -.->|"3 · poll GET /status"| apigw
-    wakeup -->|"4 · open APP_URL once ready"| shiny
-    shiny -->|"localhost:8000"| fastapi --> analysis
-    fastapi -->|"downloads .rds on first run<br/>(analysis.R reads it locally)"| s3
-    fastapi -->|"ApiActivity metric"| cw -->|"stop when idle"| ec2
+    wakeup -->|"4 · POST /run-analysis"| fastapi --> analysis --> localrds
+    fastapi -.->|"5 · results (JSON)"| wakeup
+    fastapi -->|"publish ApiActivity metric"| cw
+    cw -->|"alarm"| stopL
+    eventbridge -->|"guaranteed shutdown"| stopL
+    stopL -->|"stop"| compute
 ```
 
 **Why two front-ends?**
@@ -57,8 +67,18 @@ flowchart TD
   by shiny-server, and talks to the backend at `localhost:8000`.
 
 Keeping the public page separate means the expensive EC2 instance can stay **stopped (and unbilled)**
-whenever nobody is using it. A CloudWatch alarm watches the `ApiActivity` metric that `main.py`
-emits and stops the instance once it goes idle.
+whenever nobody is using it. The box is shut down **two ways**, both via a `stop-ec2` Lambda:
+1. **Idle alarm** — `main.py` publishes an `ApiActivity` metric; a CloudWatch alarm fires after
+   ~15 minutes of no activity.
+2. **Guaranteed shutdown** — an EventBridge scheduled rule triggers the same Lambda every 3 hours,
+   as a backstop in case the idle alarm is missed.
+
+The `stop-ec2` Lambda first **deletes the local `.rds`** on the instance (via SSM Run Command),
+then stops it.
+
+**Data lifecycle:** the Seurat `.rds` lives permanently in a private S3 bucket. On **start**, an
+SSM Run Command downloads it to the instance's local disk; on **stop**, that local copy is deleted.
+So the data only exists on EC2 while the instance is actually running.
 
 **Why a separate Python backend instead of doing the analysis in Shiny?**
 The analysis needs Seurat + AUCell on a large `.rds` object. `backend/main.py` (FastAPI) runs each
@@ -94,22 +114,23 @@ A preset **Motoneuron gene list (Yadav et al.)** is built in for one-click testi
     └── fastapi.service   systemd unit so the backend runs as a service and restarts on crash.
 ```
 
-> **Not in this repo (but required to run in production):** the API Gateway + Lambda behind
-> `POST /start-ec2` and `GET /status`, the CloudWatch auto-stop alarm, the `backend/.env` secrets,
-> and the `.rds` data file (it lives in S3).
+> **Not in this repo (but required to run in production):** the API Gateway + `start-ec2`/`stop-ec2`
+> Lambdas, the SSM Run Command documents (download/delete the `.rds`), the CloudWatch idle alarm,
+> the EventBridge 3-hour shutdown rule, the `backend/.env` secrets, and the `.rds` data file (S3).
 
 ---
 
 ## Runtime workflow (what happens on a visit)
 
 1. A visitor opens the shinyapps.io page → `wakeup_page.R` loads.
-2. Its JavaScript calls `POST {API_BASE}/start-ec2`, which triggers a Lambda that starts the EC2 box.
-3. The page polls `GET {API_BASE}/status` every 5s, showing a progress bar ("Instance is booting…").
-4. Once `/status` returns ready, the page opens `APP_URL` → the real `app.R` on EC2.
-5. In `app.R`, the user enters genes and clicks **Compute Score** / **Find Active Cells**.
-6. `app.R` calls `POST localhost:8000/run-analysis` → gets a `job_id`.
-7. `main.py` runs `analysis.R` in the background; `app.R` polls `GET /result/{job_id}` every 4s.
-8. When done, the JSON result comes back and the plots render. After idle time, CloudWatch stops the box.
+2. Its JavaScript calls `POST {API_BASE}/start-ec2`, which triggers the `start-ec2` Lambda → starts the EC2 box.
+3. On boot, an SSM Run Command downloads the `.rds` from S3 to the instance's local disk.
+4. The page polls `GET {API_BASE}/status` every 5s, showing a progress bar ("Instance is booting…").
+5. Once `/status` returns ready, the page opens `APP_URL` → the real `app.R` on EC2.
+6. In `app.R`, the user enters genes and clicks **Compute Score** / **Find Active Cells**.
+7. `app.R` calls `POST localhost:8000/run-analysis` → gets a `job_id`, then polls `GET /result/{job_id}` every 4s.
+8. `main.py` runs `analysis.R` in the background; when done, the JSON result comes back and the plots render.
+9. After ~15 min idle (or every 3 hours regardless), the `stop-ec2` Lambda deletes the local `.rds` and stops the box.
 
 ---
 
@@ -167,8 +188,11 @@ CW_NAMESPACE=NRP/ShinyApp
    reachable at `http://<EC2-IP>:3838/nrp/`.
 
 **B. Wake-up / auto-stop infra** (currently configured only in the AWS console — see note above)
-- API Gateway + Lambda for `POST /start-ec2` (`ec2:StartInstances`) and `GET /status`.
-- CloudWatch alarm on `NRP/ShinyApp → ApiActivity` that stops the idle instance.
+- API Gateway + `start-ec2` Lambda (`ec2:StartInstances`) and the `GET /status` health route.
+- SSM Run Command documents that download the `.rds` from S3 on start and delete it on stop.
+- `stop-ec2` Lambda that deletes the local `.rds` (via SSM) and stops the instance.
+- CloudWatch alarm on `NRP/ShinyApp → ApiActivity` (idle ~15 min) → `stop-ec2`.
+- EventBridge scheduled rule (every 3 hours) → `stop-ec2`, as a guaranteed-shutdown backstop.
 
 **C. Public landing page**
 - Set `NRP_API_BASE` and `NRP_APP_URL`, then publish `frontend/wakeup_page.R` to shinyapps.io.
