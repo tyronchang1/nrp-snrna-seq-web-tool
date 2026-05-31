@@ -2,8 +2,7 @@
 
 An interactive web app for exploring single-nucleus RNA-seq (snRNA-seq) data from
 iPSC-derived motoneuron (iMN) differentiation. A user pastes in a list of genes and the
-app shows, on a UMAP, **how active that gene program is** across cells and **which cells
-have it switched on** — with statistics broken down by timepoint and cluster.
+app shows, on a UMAP, **how active that gene program is** across cells and ** quantification of active cells ** — with statistics broken down by timepoint and cluster.
 
 - **Contact:** tyron@wustl.edu
 - **Public URL:** https://nrp-snrna-seq.shinyapps.io/NRP-snRNA-seq_app/
