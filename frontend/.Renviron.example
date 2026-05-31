@@ -1,0 +1,9 @@
+# Copy this file to ".Renviron" (same folder) and fill in the real values.
+# .Renviron is gitignored so these never get committed. It is still bundled to
+# shinyapps.io on deploy, which is required for the app to work.
+
+# API Gateway base URL (the wake-up endpoint that starts the EC2 instance)
+NRP_API_BASE=https://YOUR-API-ID.execute-api.us-east-2.amazonaws.com
+
+# Public address of the running app on the EC2 instance
+NRP_APP_URL=http://YOUR-EC2-IP:3838/nrp/

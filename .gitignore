@@ -1,0 +1,9 @@
+# Secrets / environment — never commit real infra URLs or credentials
+.Renviron
+.env
+backend/.env
+frontend/.Renviron
+*.pem
+
+# macOS
+.DS_Store

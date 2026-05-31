@@ -1,0 +1,15 @@
+[Unit]
+Description=FastAPI backend for Shiny AWS app
+After=network.target
+
+[Service]
+User=ec2-user
+WorkingDirectory=/home/ec2-user/backend
+EnvironmentFile=/home/ec2-user/backend/.env
+Environment="PATH=/home/ec2-user/backend/venv/bin:/usr/local/bin:/usr/bin"
+ExecStart=/home/ec2-user/backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
