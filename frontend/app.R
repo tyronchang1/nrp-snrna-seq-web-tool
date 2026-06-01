@@ -10,10 +10,11 @@ library(jsonlite)
 API_BASE <- "http://localhost:8000"
 
 DEFAULT_REDUCTION <- "umap.pca"
-CLUSTER_COL       <- "RNA_snn_res.0.2"
+CLUSTER_COL       <- "cluster_id"
 
-group_choice_cols <- c("motoneuron_flag", "subtype_annotation", "RNA_snn_res.0.2")
-timepoint_cols    <- c("subtype_annotation", "motoneuron_flag")
+group_choice_cols <- c("cell_subtypes", "group", "cluster_id")
+timepoint_cols <- c("group", "cell_subtypes")
+
 
 preset_gene_lists <- list(
   "Motoneuron (Yadav et al)" = c(
@@ -40,9 +41,9 @@ preset_gene_lists <- list(
 motoneuron_colors <- c("Motoneuron" = "#E41A1C", "Other" = "gray75")
 
 col_labels <- c(
-  "subtype_annotation" = "Timepoint (iPSC / Day7 / Day15)",
-  "RNA_snn_res.0.2"    = "Cluster ID",
-  "motoneuron_flag"    = "Cell Identity (Motoneuron / Other)"
+  "group"         = "Timepoint (iPSC / Day7 / Day15)",
+  "cluster_id"    = "Cluster ID",
+  "cell_subtypes" = "Cell Identity (Motoneuron / Other)"
 )
 
 label_cols <- function(cols) {
@@ -231,7 +232,7 @@ ui <- page_sidebar(
                   hr(),
                   selectInput("group", "Color cells by:",
                               choices  = label_cols(group_choice_cols),
-                              selected = if ("motoneuron_flag" %in% group_choice_cols) "motoneuron_flag" else group_choice_cols[1])
+                              selected = if ("cell_subtypes" %in% group_choice_cols) "cell_subtypes" else group_choice_cols[1])
                 ),
                 mainPanel(
                   div(class = "section-header", "Gene Activity Map"),
@@ -521,14 +522,14 @@ server <- function(input, output, session) {
                                 label.size = 0.35, force = 10, force_pull = 0.5, max.overlaps = Inf, show.legend = FALSE) +
       labs(title = title_label, x = "UMAP_1", y = "UMAP_2", color = NULL) +
       theme_app() + theme(plot.title = element_text(face = "bold", hjust = 0.5))
-    if (input$group == "subtype_annotation") {
+    if (input$group == "group") {
       p <- p + scale_color_manual(values = c("iPSC" = "#F5A623", "Day7" = "#E41A1C", "Day15" = "#377EB8"), na.value = "gray80")
-    } else if (input$group == "motoneuron_flag") {
+    } else if (input$group == "cell_subtypes") {
       p <- p + scale_color_manual(values = motoneuron_colors, na.value = "gray80")
     }
     p
   })
-  
+
   output$violinPlot <- renderPlot({
     req(input$group %in% group_choice_cols)
     df <- score_df()
@@ -555,8 +556,8 @@ server <- function(input, output, session) {
   
   output$auc_umap_timepoint <- renderPlot({
     df <- auc_df()
-    req("subtype_annotation" %in% colnames(df))
-    df$group <- factor(df$subtype_annotation, levels = c("iPSC", "Day7", "Day15"))
+    req("group" %in% colnames(df))
+    df$group <- factor(df$group, levels = c("iPSC", "Day7", "Day15"))
     centers  <- df %>% filter(!is.na(group)) %>% group_by(group) %>%
       summarise(UMAP_1 = median(UMAP_1), UMAP_2 = median(UMAP_2), .groups = "drop")
     ggplot(df, aes(UMAP_1, UMAP_2, color = group)) +
@@ -600,8 +601,8 @@ server <- function(input, output, session) {
   
   output$auc_umap_score <- renderPlot({
     df <- auc_df()
-    if (input$auc_timepoint_col == "motoneuron_flag" && "motoneuron_flag" %in% colnames(df)) {
-      grp_df  <- df %>% mutate(group = factor(motoneuron_flag))
+    if (input$auc_timepoint_col == "cell_subtypes" && "cell_subtypes" %in% colnames(df)) {
+      grp_df  <- df %>% mutate(group = factor(cell_subtypes))
       centers <- grp_df %>% filter(!is.na(group)) %>% group_by(group) %>%
         summarise(UMAP_1 = median(UMAP_1), UMAP_2 = median(UMAP_2), .groups = "drop")
       ggplot(grp_df, aes(UMAP_1, UMAP_2, color = group)) +
@@ -695,7 +696,7 @@ server <- function(input, output, session) {
     df <- auc_df()
     req(input$auc_timepoint_col %in% colnames(df))
     col_vals   <- df[[input$auc_timepoint_col]]
-    timepoints <- if (input$auc_timepoint_col == "subtype_annotation") c("iPSC", "Day7", "Day15") else sort(unique(col_vals[!is.na(col_vals)]))
+    timepoints <- if (input$auc_timepoint_col == "group") c("iPSC", "Day7", "Day15") else sort(unique(col_vals[!is.na(col_vals)]))
     df_cells   <- df %>% filter(.data[[input$auc_timepoint_col]] %in% timepoints)
     if (nrow(df_cells) == 0) { showNotification("No cells matched the specified timepoints.", type = "warning"); return(NULL) }
     group_label <- if (input$auc_timepoint_col %in% names(col_labels)) col_labels[input$auc_timepoint_col] else input$auc_timepoint_col

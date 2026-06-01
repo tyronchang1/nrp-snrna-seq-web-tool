@@ -29,11 +29,11 @@ flowchart TD
     subgraph control["AWS Control Plane · serverless"]
         apigw["API Gateway<br/>(HTTP API)"]
         startL["Lambda<br/>(start-ec2)"]
-        ec2start["EC2<br/>(Start)"]
-        ssm["Systems Manager<br/>(SSM Run Command)"]
+        ec2start["EC2<br/>(StartInstances)"]
     end
 
     subgraph compute["AWS Compute Plane · EC2, on-demand"]
+        dl["download-rds.service<br/>oneshot at boot"]
         fastapi["FastAPI (Uvicorn)<br/>systemd auto-start<br/>/status · /run-analysis"]
         analysis["analysis.R<br/>Seurat + AUCell"]
         localrds[("Local FS<br/>seurat_object.rds<br/>(copy, deleted on stop)")]
@@ -48,8 +48,9 @@ flowchart TD
     s3[("Amazon S3<br/>private bucket<br/>seurat_object.rds")]
 
     visitor -->|"1 · open app"| wakeup
-    wakeup -->|"2 · POST /start-ec2"| apigw --> startL -->|"StartInstances()"| ec2start --> ssm
-    ssm -->|"download .rds to local disk"| s3
+    wakeup -->|"2 · POST /start-ec2"| apigw --> startL -->|"StartInstances()"| ec2start --> dl
+    s3 -->|"download .rds on boot"| dl --> localrds
+    dl -->|"then start"| fastapi
     wakeup -.->|"3 · poll GET /status"| apigw
     wakeup -->|"4 · POST /run-analysis"| fastapi --> analysis --> localrds
     fastapi -.->|"5 · results (JSON)"| wakeup
@@ -76,9 +77,10 @@ whenever nobody is using it. The box is shut down **two ways**, both via a `stop
 The `stop-ec2` Lambda first **deletes the local `.rds`** on the instance (via SSM Run Command),
 then stops it.
 
-**Data lifecycle:** the Seurat `.rds` lives permanently in a private S3 bucket. On **start**, an
-SSM Run Command downloads it to the instance's local disk; on **stop**, that local copy is deleted.
-So the data only exists on EC2 while the instance is actually running.
+**Data lifecycle:** the Seurat `.rds` lives permanently in a private S3 bucket. On **start**, the
+`download-rds` systemd service pulls it to the instance's local disk (before FastAPI comes up); on
+**stop**, the `stop-ec2` Lambda deletes that local copy. So the data only exists on EC2 while the
+instance is actually running.
 
 **Why a separate Python backend instead of doing the analysis in Shiny?**
 The analysis needs Seurat + AUCell on a large `.rds` object. `backend/main.py` (FastAPI) runs each
@@ -109,13 +111,16 @@ A preset **Motoneuron gene list (Yadav et al.)** is built in for one-click testi
 └── backend/              Everything that runs on the EC2 instance
     ├── main.py           FastAPI server. Endpoints: /status, /run-analysis, /result/{job_id}.
     ├── analysis.R        The computation: Seurat AddModuleScore + AUCell. Called by main.py.
-    ├── download_rds.py   One-off helper to pre-pull the Seurat .rds from S3.
+    ├── download_rds.py   Pulls the Seurat .rds from S3. Run at boot by download-rds.service.
     ├── requirements.txt  Python dependencies for the backend.
-    └── fastapi.service   systemd unit so the backend runs as a service and restarts on crash.
+    └── system_services/  systemd units installed on the EC2 box (boot order: download → api → shiny):
+        ├── download-rds.service  oneshot — downloads the .rds at boot, before FastAPI starts.
+        ├── fastapi.service       runs the FastAPI backend (uvicorn), restarts on crash.
+        └── shiny-server.service  runs shiny-server, which serves frontend/app.R.
 ```
 
 > **Not in this repo (but required to run in production):** the API Gateway + `start-ec2`/`stop-ec2`
-> Lambdas, the SSM Run Command documents (download/delete the `.rds`), the CloudWatch idle alarm,
+> Lambdas, the SSM Run Command document (deletes the local `.rds` on stop), the CloudWatch idle alarm,
 > the EventBridge 3-hour shutdown rule, the `backend/.env` secrets, and the `.rds` data file (S3).
 
 ---
@@ -124,7 +129,7 @@ A preset **Motoneuron gene list (Yadav et al.)** is built in for one-click testi
 
 1. A visitor opens the shinyapps.io page → `wakeup_page.R` loads.
 2. Its JavaScript calls `POST {API_BASE}/start-ec2`, which triggers the `start-ec2` Lambda → starts the EC2 box.
-3. On boot, an SSM Run Command downloads the `.rds` from S3 to the instance's local disk.
+3. On boot, the `download-rds` systemd service runs `download_rds.py` to copy the `.rds` from S3 to local disk (before FastAPI starts).
 4. The page polls `GET {API_BASE}/status` every 5s, showing a progress bar ("Instance is booting…").
 5. Once `/status` returns ready, the page opens `APP_URL` → the real `app.R` on EC2.
 6. In `app.R`, the user enters genes and clicks **Compute Score** / **Find Active Cells**.
@@ -163,8 +168,8 @@ shinyapps.io dashboard instead of using a file.
 ```dotenv
 AWS_REGION=us-east-2
 S3_BUCKET=nrp-snrna-seq
-S3_KEY=iMN/all_WT_iMN_no_harmony_040826.rds
-LOCAL_RDS=/home/ec2-user/backend/all_WT_iMN_no_harmony_040826.rds
+S3_KEY=iMN/all_WT_iMN_no_harmony_050826.rds
+LOCAL_RDS=/home/ec2-user/backend/all_WT_iMN_no_harmony_050826.rds
 R_SCRIPT=/home/ec2-user/backend/analysis.R
 CW_NAMESPACE=NRP/ShinyApp
 ```
@@ -178,19 +183,22 @@ CW_NAMESPACE=NRP/ShinyApp
    bucket and `cloudwatch:PutMetricData`.
 2. Install R + shiny-server, Python 3.10+, and the package deps (`requirements.txt`; Seurat/AUCell for R).
 3. Copy `backend/` to `/home/ec2-user/backend/` and create `backend/.env` (see above).
-4. Run the backend as a service:
+4. Install the systemd units so the box self-configures on every boot:
    ```bash
-   sudo cp backend/fastapi.service /etc/systemd/system/
+   sudo cp backend/system_services/*.service /etc/systemd/system/
    sudo systemctl daemon-reload
-   sudo systemctl enable --now fastapi
+   # download-rds runs first (oneshot), then FastAPI, then shiny-server
+   sudo systemctl enable --now download-rds fastapi shiny-server
    ```
+   On boot the chain is: `download-rds.service` pulls the `.rds` from S3 → `fastapi.service`
+   starts the backend → `shiny-server.service` serves the app.
 5. Put `frontend/app.R` where shiny-server serves it (e.g. `/srv/shiny-server/nrp/app.R`) so it is
    reachable at `http://<EC2-IP>:3838/nrp/`.
 
 **B. Wake-up / auto-stop infra** (currently configured only in the AWS console — see note above)
 - API Gateway + `start-ec2` Lambda (`ec2:StartInstances`) and the `GET /status` health route.
-- SSM Run Command documents that download the `.rds` from S3 on start and delete it on stop.
-- `stop-ec2` Lambda that deletes the local `.rds` (via SSM) and stops the instance.
+- `stop-ec2` Lambda that deletes the local `.rds` (via an SSM Run Command) and stops the instance.
+  (The start-side download is handled on the box by `download-rds.service`, not SSM.)
 - CloudWatch alarm on `NRP/ShinyApp → ApiActivity` (idle ~15 min) → `stop-ec2`.
 - EventBridge scheduled rule (every 3 hours) → `stop-ec2`, as a guaranteed-shutdown backstop.
 
